@@ -2,6 +2,7 @@ flask==3.0.0
 flask-cors==4.0.0
 pinecone==6.0.0
 sentence-transformers==2.7.0
+groq==0.11.0
 requests
 beautifulsoup4
 lxml
