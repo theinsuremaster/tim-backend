@@ -13,7 +13,7 @@ CORS(app)
 
 # --- Keys ---
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index = pc.Index("tim-docs")
+index = pc.Index("tim-knowledge")
 embed = SentenceTransformer('all-MiniLM-L6-v2')
 groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
