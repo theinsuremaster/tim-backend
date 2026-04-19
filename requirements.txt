@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 groq
-pinecone-client
+pinecone
 fastembed
