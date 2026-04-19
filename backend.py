@@ -20,22 +20,13 @@ class Query(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Ask TIM with Pinecone running"}
+    return {"status": "Ask TIM with Pinecone"}
 
 @app.post("/ask")
 def ask(q: Query):
-    # 1. Embed question and search Pinecone
     q_vec = embedder.encode(q.question).tolist()
     results = index.query(vector=q_vec, top_k=3, include_metadata=True)
     context = "\n".join([m.metadata.get('text','') for m in results.matches])
-
-    # 2. Build prompt with context
-    prompt = f"Use this context if relevant:\n{context}\n\nQuestion: {q.question}"
-
-    resp = groq_client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.3,
-        max_tokens=500
-    )
-    return {"answer": resp.choices[0].message.content, "sources": len(results.matches)}
+    prompt = f"Use this context:\n{context}\n\nQuestion: {q.question}"
+    resp = groq_client.chat.completions.create(model=MODEL, messages=[{"role":"user","content":prompt}], temperature=0.3, max_tokens=512)
+    return {"answer": resp.choices[0].message.content}
