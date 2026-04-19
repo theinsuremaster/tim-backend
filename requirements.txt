@@ -2,5 +2,4 @@ fastapi
 uvicorn
 groq
 pinecone-client
-sentence-transformers
-torch
+fastembed
