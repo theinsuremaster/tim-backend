@@ -1,5 +1,6 @@
-fastapi
-uvicorn
-groq
+flask
+flask-cors
 pinecone
-fastembed
+sentence-transformers
+requests
+beautifulsoup4
