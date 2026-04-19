@@ -2,5 +2,7 @@ flask
 flask-cors
 pinecone
 sentence-transformers
+transformers
+torch
 requests
 beautifulsoup4
