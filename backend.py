@@ -23,7 +23,7 @@ PRIORITY_SITES = [
     "thomsonreuters.com",
     "iii.org",
     "naic.org",
-    "the Institutes.org",
+    "theInstitutes.org",
     "rims.org",
     "ambest.com"
 ]
