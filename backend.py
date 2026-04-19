@@ -1,60 +1,79 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import os
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from pinecone import Pinecone
+from sentence_transformers import SentenceTransformer
+import requests
+from bs4 import BeautifulSoup
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = Flask(__name__)
+CORS(app)
 
-class Query(BaseModel):
-    question: str
+# Pinecone setup
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+index = pc.Index("tim-docs")
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Lazy globals
-_groq = None
-_pc_index = None
-_embedder = None
+BRAVE_KEY = os.getenv("BRAVE_API_KEY")
 
-def get_services():
-    global _groq, _pc_index, _embedder
-    if _groq is None:
-        from groq import Groq
-        from pinecone import Pinecone
-        from fastembed import TextEmbedding
-
-        groq_key = os.getenv("GROQ_API_KEY")
-        pc_key = os.getenv("PINECONE_API_KEY")
-        index_name = os.getenv("PINECONE_INDEX", "tim-knowledge")
-
-        if not groq_key:
-            raise ValueError("Missing GROQ_API_KEY in Render Environment")
-        if not pc_key:
-            raise ValueError("Missing PINECONE_API_KEY in Render Environment")
-
-        _groq = Groq(api_key=groq_key)
-        pc = Pinecone(api_key=pc_key)
-        _pc_index = pc.Index(index_name)
-        _embedder = TextEmbedding("BAAI/bge-small-en-v1.5")
-    return _groq, _pc_index, _embedder
-
-@app.get("/")
-def root():
-    return {"status": "Ask TIM is ready to be deployed"}
-
-@app.post("/ask")
-def ask(q: Query):
+def search_web(query):
     try:
-        groq_client, index, embedder = get_services()
-        q_vec = list(embedder.embed(q.question))[0].tolist()
-        results = index.query(vector=q_vec, top_k=3, include_metadata=True)
-        context = "\n".join([m.metadata.get('text','') for m in results.matches if m.metadata])
+        # Try Brave first if key exists
+        if BRAVE_KEY:
+            headers = {"X-Subscription-Token": BRAVE_KEY}
+            r = requests.get(f"https://api.search.brave.com/res/v1/web/search?q={query}&count=3", headers=headers, timeout=10)
+            data = r.json()
+            results = [f"{item['title']}: {item['description']}" for item in data.get('web',{}).get('results',[])[:3]]
+            return "\n".join(results), "Brave Search"
+    except:
+        pass
 
-        prompt = f"Use this context to answer:\n{context}\n\nQuestion: {q.question}"
-        resp = groq_client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.3,
-            max_tokens=512
-        )
-        return {"answer": resp.choices[0].message.content}
+    # Fallback: free DuckDuckGo html
+    try:
+        r = requests.get(f"https://html.duckduckgo.com/html/?q={query}", headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        results = []
+        for result in soup.select('.result__body')[:3]:
+            title = result.select_one('.result__title').get_text(strip=True)
+            snippet = result.select_one('.result__snippet').get_text(strip=True)
+            results.append(f"{title}: {snippet}")
+        return "\n".join(results), "Web Search"
     except Exception as e:
-        return {"error": str(e), "hint": "Check Render Environment variables and Pinecone index"}
+        return f"Web search failed: {e}", "Error"
+
+@app.route('/ask', methods=['POST'])
+def ask():
+    question = request.json.get('question', '')
+
+    # 1. Search Pinecone
+    vector = model.encode(question).tolist()
+    results = index.query(vector=vector, top_k=3, include_metadata=True)
+
+    docs_text = ""
+    best_score = 0
+    if results.matches:
+        best_score = results.matches[0].score
+        for match in results.matches:
+            if match.score > 0.7:
+                docs_text += match.metadata.get('text', '')[:500] + "\n\n"
+
+    # 2. Decide source
+    if docs_text and best_score > 0.75:
+        answer = f"[From your documents]\n\n{docs_text[:1500]}"
+        source = "docs"
+    else:
+        web_text, source_name = search_web(question)
+        if docs_text:
+            answer = f"[From your documents + {source_name}]\n\nYour docs say: {docs_text[:800]}\n\nWeb results: {web_text[:800]}"
+        else:
+            answer = f"[From {source_name}]\n\n{web_text}"
+        source = "web"
+
+    return jsonify({"answer": answer, "source": source})
+
+@app.route('/')
+def home():
+    return jsonify({"status": "Ask TIM hybrid - ready"})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
