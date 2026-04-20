@@ -5,6 +5,7 @@ pinecone-client==5.0.1
 fastembed==0.2.2
 beautifulsoup4==4.12.3
 requests==2.32.3
-lxml==5.2
+lxml==5.2.0
 onnxruntime==1.18.0
 gunicorn==22.0.0
+numpy==1.26.4
