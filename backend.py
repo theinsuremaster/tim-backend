@@ -1,133 +1,90 @@
-import os, re
-from datetime import datetime
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from pinecone import Pinecone
-from sentence_transformers import SentenceTransformer
 from groq import Groq
 import requests
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 CORS(app)
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# --- Keys ---
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index = pc.Index("tim-knowledge")
-embed = SentenceTransformer('all-MiniLM-L6-v2')
-groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# System prompt — exactly as you designed
+SYSTEM = """You are 'Ask TIM,' the authoritative AI assistant for The InsureMaster.
+Core Knowledge: Your expertise is grounded in insurance, risk management, and financial services.
+Research Mandate: When user asks, you MUST synthesize information from: 1) Internal books, 2) IRMI, NAIC, III, and other authoritative web sources, 3) Your base knowledge.
+Output Style: Write like Meta AI — conversational, clear, well-formatted with headings and bullets. Cite sources as [Source]. Always paraphrase, never copy verbatim.
+Audience: Adapt tone for 'professional' vs 'consumer' as specified.
+Disclaimer: End every answer with: '---\n*This information is for educational purposes. Consult a licensed professional for advice specific to your situation.*'
+"""
 
-PRIORITY = ["irmi.com","lexisnexis.com","thomsonreuters.com","iii.org","naic.org","rims.org","ambest.com","investopedia.com"]
-
-DISCLAIMER = "\n\n---\n**Disclaimer:** This information is for educational purposes only. It may be incomplete or inaccurate. Always consult a licensed professional or qualified expert before making decisions based on this information."
-
-def get_internal(question):
-    vec = embed.encode(question).tolist()
-    res = index.query(vector=vec, top_k=5, include_metadata=True)
-    texts = [m.metadata.get('text','') for m in res.matches if m.score>0.68]
-    return " ".join(texts)[:3000]
-
-def get_external(question):
+def get_web_results(question):
+    """Lightweight DuckDuckGo scraper - no API keys"""
     try:
-        headers = {"User-Agent":"Mozilla/5.0"}
-        sites = " OR ".join([f"site:{s}" for s in PRIORITY])
-        url = f"https://html.duckduckgo.com/html/?q={question} ({sites})"
-        r = requests.get(url, headers=headers, timeout=10)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        # Search authoritative sources only
+        sites = "site:irmi.com OR site:naic.org OR site:iii.org OR site:investopedia.com"
+        url = f"https://html.duckduckgo.com/html/?q={question} {sites}"
+
+        r = requests.get(url, headers=headers, timeout=8)
         soup = BeautifulSoup(r.text, 'html.parser')
+
         results = []
-        for item in soup.select('.result')[:5]:
-            title = item.select_one('.result__title')
-            snippet = item.select_one('.result__snippet')
-            link = item.select_one('.result__url')
-            if snippet and link:
-                source = link.get_text(strip=True).split('.')[0]
-                results.append({
-                    "text": snippet.get_text(strip=True),
-                    "source": source.upper()
-                })
-        return results
-    except:
-        return []
-
-def learn(question, content):
-    try:
-        if content:
-            vec = embed.encode(question).tolist()
-            index.upsert([{"id":f"learn_{int(datetime.now().timestamp())}","values":vec,"metadata":{"text":content[:1000],"source":"web"}}])
-    except: pass
-
-def synthesize(question, audience, internal, external):
-    # Build prompt following system rules
-    mode = "PROFESSIONAL" if audience=="professional" else "GENERAL CONSUMER"
-
-    external_text = "\n".join([f"- {e['text']} (SOURCE:{e['source']})" for e in external])
-    sources = " ".join([f"🔗 {e['source']}" for e in external[:3]])
-
-    system_prompt = f"""You are The InsureMaster AI Assistant.
-Audience: {mode}
-Rules:
-- Use internal knowledge but NEVER quote it verbatim, never reveal source
-- Paraphrase external sources, cite with icons only
-- If PROFESSIONAL: use technical terms, frameworks, underwriting logic
-- If GENERAL CONSUMER: use plain language, step-by-step, no jargon
-- Format with short paragraphs, bullets, or tables
-- Never give binding advice"""
-
-    user_prompt = f"""Question: {question}
-Internal knowledge (paraphrase only): {internal}
-External findings: {external_text}
-
-Provide a clear answer for a {mode.lower()}. End with sources as icons."""
-
-    try:
-        resp = groq.chat.completions.create(
-            model="llama-3.1-70b-versatile",
-            messages=[
-                {"role":"system","content":system_prompt},
-                {"role":"user","content":user_prompt}
-            ],
-            temperature=0.3,
-            max_tokens=800
-        )
-        answer = resp.choices[0].message.content
-        if sources:
-            answer += f"\n\nSources: {sources}"
-        return answer + DISCLAIMER
+        for result in soup.select('.result')[:4]:
+            title = result.select_one('.result__title')
+            snippet = result.select_one('.result__snippet')
+            if snippet:
+                text = snippet.get_text(strip=True)[:300]
+                source = "IRMI" if "irmi" in str(result) else "NAIC" if "naic" in str(result) else "III" if "iii" in str(result) else "WEB"
+                results.append(f"[{source}] {text}")
+        return "\n\n".join(results) if results else "No recent web sources found."
     except Exception as e:
-        return f"Unable to generate response. {DISCLAIMER}"
+        return f"Web search temporarily unavailable."
 
-@app.route('/ask', methods=['POST'])
+@app.route("/")
+def home():
+    return jsonify({"status": "Ask TIM operational", "mode": "free-tier"})
+
+@app.route("/ask", methods=["POST"])
 def ask():
     data = request.json
-    question = data.get('question','').strip()
-    audience = data.get('audience','').lower() # 'professional' or 'consumer'
+    question = data.get("question", "")
+    audience = data.get("audience", "consumer")
 
-    if not question:
-        return jsonify({"answer":"Please ask a question."})
+    # 1. Get live web data
+    web_data = get_web_results(question)
 
-    # Dual-audience check
-    if not audience:
-        return jsonify({
-            "ask_audience": True,
-            "answer": "Are you an insurance/risk/finance professional, or a general consumer?"
-        })
+    # 2. Build prompt for Groq
+    audience_instruction = "Explain simply, avoid jargon." if audience == "consumer" else "Use technical insurance terminology, assume professional knowledge."
 
-    # Get knowledge
-    internal = get_internal(question)
-    external = get_external(question)
+    user_prompt = f"""Question: {question}
+Audience: {audience} - {audience_instruction}
 
-    # Learn
-    if external:
-        learn(question, " ".join([e['text'] for e in external]))
+LIVE WEB RESEARCH:
+{web_data}
 
-    # Synthesize with Groq
-    answer = synthesize(question, audience, internal, external)
+Synthesize a comprehensive answer using the web research above. Format with headings and bullets like Meta AI. Cite sources inline as [IRMI], [NAIC], etc."""
 
-    return jsonify({"answer": answer, "audience": audience})
+    # 3. Get Groq response
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1500
+        )
+        answer = completion.choices[0].message.content
+    except Exception as e:
+        answer = f"Error generating response: {str(e)}"
 
-@app.route('/')
-def health():
-    return jsonify({"status":"InsureMaster AI ready"})
+    return jsonify({
+        "answer": answer,
+        "sources_used": ["Web Search", "Groq Llama 3.3"],
+        "audience": audience
+    })
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)))
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
