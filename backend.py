@@ -1,154 +1,174 @@
-import os
+import os, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from groq import Groq
 from pinecone import Pinecone
 from fastembed import TextEmbedding
-import requests
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 CORS(app)
 
-# Initialize clients
+VERSION = "Ask TIM v4.3"
+
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-
-# CHANGE: Using your index name
-INDEX_NAME = "tim-knowledge"
-index = pc.Index(INDEX_NAME)
-
-# Lightweight embedder (replaces sentence-transformers)
+index = pc.Index("tim-knowledge")
 embed = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+os.environ["ONNXRUNTIME_LOG_LEVEL"] = "3"
 
-SYSTEM = """You are 'Ask TIM,' the authoritative AI assistant for The InsureMaster.
-Core Knowledge: Insurance, risk management, and financial services.
-Research Mandate: Synthesize from: 1) Internal knowledge base (Pinecone), 2) IRMI, NAIC, III, Investopedia, 3) Your base knowledge.
-Output Style: Write like Meta AI — conversational, clear, with headings and bullets. Cite sources as [Source].
-Audience: Adapt for 'professional' (technical) vs 'consumer' (simple).
-Disclaimer: End every answer with: '---\n*This information is for educational purposes. Consult a licensed professional for advice specific to your situation.*'
-"""
+COURTLISTENER_TOKEN = os.getenv("COURTLISTENER_TOKEN", "")
+
+TIERS = {
+    "free": {"web_results": 10, "case_results": 3, "max_tokens": 1500},
+    "pro": {"web_results": 25, "case_results": 5, "max_tokens": 2500},
+    "enterprise": {"web_results": 25, "case_results": 8, "max_tokens": 3000}
+}
 
 def get_internal(question):
-    """Search Pinecone tim-knowledge index"""
     try:
-        # FastEmbed returns generator, get first vector
         vec = list(embed.embed(question))[0].tolist()
+        results = index.query(vector=vec, top_k=8, include_metadata=True)
+        return "\n\n".join([m.metadata.get('text','')[:800] for m in results.matches])
+    except:
+        return ""
 
-        results = index.query(
-            vector=vec,
-            top_k=3,
-            include_metadata=True
-        )
+def search_engines(question, limit):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    results = []
+    seen = set()
 
-        texts = []
-        for match in results.matches:
-            text = match.metadata.get('text', '')[:400]
-            source = match.metadata.get('source', 'TIM Knowledge')
-            page = match.metadata.get('page', '')
-            citation = f"{source} p.{page}" if page else source
-            texts.append(f"[{citation}] {text}")
-
-        return "\n\n".join(texts) if texts else "No internal matches found."
-    except Exception as e:
-        return f"Internal knowledge base temporarily unavailable."
-
-def get_web(question):
-    """Lightweight web search from authoritative sources"""
+    # 1. DuckDuckGo
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        # Limit to insurance authorities
-        sites = "site:irmi.com OR site:naic.org OR site:iii.org OR site:investopedia.com"
-        url = f"https://html.duckduckgo.com/html/?q={question} {sites}"
-
-        r = requests.get(url, headers=headers, timeout=8)
+        r = requests.get(f"https://html.duckduckgo.com/html/?q={question}", headers=headers, timeout=8)
         soup = BeautifulSoup(r.text, 'html.parser')
+        for res in soup.select('.result')[:limit]:
+            title = res.select_one('.result__title')
+            snippet = res.select_one('.result__snippet')
+            link = res.select_one('.result__url')
+            if title and link:
+                href = link.get('href','')
+                if href and href not in seen and href.startswith('http'):
+                    results.append({"title": title.get_text(strip=True), "snippet": snippet.get_text(strip=True)[:280] if snippet else "", "url": href})
+                    seen.add(href)
+    except: pass
 
-        results = []
-        for result in soup.select('.result')[:3]:
-            snippet = result.select_one('.result__snippet')
-            if snippet:
-                text = snippet.get_text(strip=True)[:280]
-                # Detect source
-                html = str(result).lower()
-                if 'irmi' in html:
-                    source = 'IRMI'
-                elif 'naic' in html:
-                    source = 'NAIC'
-                elif 'iii.org' in html:
-                    source = 'III'
-                else:
-                    source = 'WEB'
-                results.append(f"[{source}] {text}")
+    # 2. Brave
+    if len(results) < limit:
+        try:
+            r = requests.get(f"https://search.brave.com/search?q={question}", headers=headers, timeout=8)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for item in soup.select('div.snippet')[:limit-len(results)]:
+                a = item.find_previous('a')
+                if a and a.get('href','').startswith('http'):
+                    href = a['href']
+                    if href not in seen:
+                        results.append({"title": a.get_text(strip=True)[:80], "snippet": item.get_text(strip=True)[:280], "url": href})
+                        seen.add(href)
+        except: pass
 
-        return "\n\n".join(results) if results else "No recent web sources found."
-    except Exception as e:
-        return "Web search temporarily unavailable."
+    # 3. Bing - restored
+    if len(results) < limit:
+        try:
+            r = requests.get(f"https://www.bing.com/search?q={question}", headers=headers, timeout=8)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for li in soup.select('li.b_algo')[:limit-len(results)]:
+                a = li.select_one('h2 a')
+                p = li.select_one('.b_caption p')
+                if a and a.get('href'):
+                    href = a['href']
+                    if href not in seen and href.startswith('http'):
+                        results.append({"title": a.get_text(strip=True), "snippet": p.get_text(strip=True)[:280] if p else "", "url": href})
+                        seen.add(href)
+        except: pass
 
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "Ask TIM operational",
-        "index": INDEX_NAME,
-        "mode": "pinecone+web+groq"
-    })
+    return results[:limit]
+
+def get_web(question, tier, audience):
+    return search_engines(question, TIERS[tier]["web_results"])
+
+def get_caselaw(question, audience, tier):
+    if audience!= "professional": return []
+    if not any(k in question.lower() for k in ['coverage','policy','exclusion','claim','duty','bad faith','indemnity']): return []
+
+    limit = TIERS[tier]["case_results"]
+    cases = []
+    is_uk = any(w in question.lower() for w in ['uk','england','scotland','wales'])
+
+    try:
+        if is_uk:
+            r = requests.get(f"https://html.duckduckgo.com/html/?q={question} insurance site:bailii.org", headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for res in soup.select('.result')[:limit]:
+                link = res.select_one('.result__url'); title = res.select_one('.result__title')
+                if link and 'bailii' in link.get('href',''):
+                    cases.append({"title": title.get_text(strip=True), "url": link.get('href','')})
+        else:
+            if COURTLISTENER_TOKEN:
+                headers = {"Authorization": f"Token {COURTLISTENER_TOKEN}"}
+                r = requests.get("https://www.courtlistener.com/api/rest/v4/search/", headers=headers, params={"q": f"{question} insurance", "type": "o", "order_by": "score desc"}, timeout=10)
+                if r.status_code == 200:
+                    for item in r.json().get('results', [])[:limit]:
+                        name = item.get('caseName',''); url = f"https://www.courtlistener.com{item.get('absolute_url','')}"
+                        cases.append({"title": f"{name} {item.get('citation','')}".strip(), "url": url})
+    except: pass
+    return cases
 
 @app.route("/ask", methods=["POST"])
 def ask():
     data = request.json
-    question = data.get("question", "")
-    audience = data.get("audience", "consumer")
+    question = data.get("question","")
+    audience = data.get("audience","consumer")
+    tier = data.get("tier","free")
 
-    if not question:
-        return jsonify({"error": "No question provided"}), 400
+    if not question: return jsonify({"error":"No question"}), 400
 
-    # Get both sources
-    internal = get_internal(question)
-    web = get_web(question)
+    blocked = ['diagnose','prescribe','medical advice','hipaa','attorney client']
+    if any(b in question.lower() for b in blocked) and 'insurance' not in question.lower():
+        return jsonify({"answer": "Ask TIM specializes in insurance only. See https://theinsuremaster.com/disclaimer"})
 
-    # Audience instruction
-    tone = "Explain in plain language, avoid jargon, use examples." if audience == "consumer" else "Use precise insurance terminology, assume CPCU-level knowledge."
+    web_results = get_web(question, tier, audience)
+    internal = get_internal(question) if audience == "professional" else ""
+    cases = get_caselaw(question, audience, tier) if audience == "professional" else []
 
-    user_prompt = f"""Question: {question}
+    references = []
+    for w in web_results:
+        if w['url']: references.append(f"[{w['title']}]({w['url']})")
+    for c in cases: references.append(f"[{c['title']}]({c['url']})")
 
-AUDIENCE: {audience.upper()} - {tone}
+    confidence = "High"
+    if audience == "professional" and len(cases) == 0 and 'coverage' in question.lower():
+        confidence = "Medium - limited case law found"
 
-INTERNAL KNOWLEDGE BASE (tim-knowledge):
-{internal}
+    if audience == "consumer":
+        voice = "You are Ask TIM for consumers. Answer in plain English, paraphrased. Example: 'Are there any benefits of bundling home and auto insurance with one insurer, or can I insure them separately' — explain pros/cons. Use ## headings, bullets. No links in body."
+    else:
+        voice = "You are Ask TIM for professionals. Paraphrase internal knowledge. Do not cite Pinecone publications. Cite case law properly by legal name only."
 
-LIVE WEB RESEARCH:
-{web}
+    system = f"{voice}\nNever copy verbatim. Only cite case law."
 
-INSTRUCTIONS:
-1. Synthesize a comprehensive answer using both sources
-2. Prioritize internal knowledge, supplement with web
-3. Format with clear headings and bullet points
-4. Cite sources inline like [IRMI] or [TIM Knowledge p.23]
-5. Adapt complexity for {audience} audience"""
+    web_text = "\n".join([f"{w['title']}: {w['snippet']}" for w in web_results[:10]])
+    user_prompt = f"QUESTION: {question}\n\nINTERNAL:\n{internal[:2000]}\n\nWEB:\n{web_text}\n\nCASES:\n{chr(10).join([c['title'] for c in cases])}"
 
-    try:
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.3,
-            max_tokens=1800
-        )
-        answer = completion.choices[0].message.content
-    except Exception as e:
-        answer = f"Error generating response: {str(e)}"
+    completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role":"system","content":system},{"role":"user","content":user_prompt}],
+        temperature=0.3,
+        max_tokens=TIERS[tier]["max_tokens"]
+    )
+    answer = completion.choices[0].message.content
 
-    return jsonify({
-        "answer": answer,
-        "sources": {
-            "internal": "tim-knowledge" in internal.lower() or "TIM" in internal,
-            "web": "IRMI" in web or "NAIC" in web
-        },
-        "audience": audience
-    })
+    if references:
+        answer += "\n\n### References\n" + "\n".join([f"- {ref}" for ref in references[:15]])
+    if audience == "professional":
+        answer += f"\n\n*Confidence: {confidence}*"
+    answer += "\n\n---\n[Disclaimer](https://theinsuremaster.com/disclaimer)"
+
+    return jsonify({"answer": answer, "audience": audience})
+
+@app.route("/")
+def home():
+    return jsonify({"status": VERSION})
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
