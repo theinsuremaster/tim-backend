@@ -134,21 +134,30 @@ Respond in EXACT format:
 4. CONFIDENCE: High/Medium/Low
 """
 
-@app.route('/health')
-def health():
+@app.route('/', methods=['GET', 'HEAD'])
+def home():
+    # Render checks HEAD / — return 200
+    if request.method == 'HEAD':
+        return '', 200
+
+    # GET / shows status (so you can click the log link)
     return jsonify({
-        "status":"ok",
-        "version":"5.2",
+        "service": "Ask TIM",
+        "status": "live",
+        "version": "5.2",
         "groq": bool(get_groq()),
         "pinecone_index": os.getenv("PINECONE_INDEX", "tim-knowledge"),
-        "pinecone_connected": bool(get_pinecone())
+        "pinecone_connected": bool(get_pinecone()),
+        "endpoints": {
+            "ask": "/ask?q=your+question",
+            "health": "/health"
+        }
     })
 
-@app.route('/ask', methods=['GET','POST'])
-def ask():
-    q = request.args.get('q') or (request.json or {}).get('q','')
-    if not q:
-        return jsonify({"error":"No query"}),400
+@app.route('/health', methods=['GET'])
+def health():
+    # keep /health for backwards compatibility
+    return home()
     
     region = get_user_region()
     
