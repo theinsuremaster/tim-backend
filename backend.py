@@ -136,23 +136,22 @@ Respond in EXACT format:
 
 @app.route('/', methods=['GET', 'HEAD'])
 def home():
-    # Render checks HEAD / — return 200
     if request.method == 'HEAD':
         return '', 200
-
-    # GET / shows status (so you can click the log link)
-    return jsonify({
-        "service": "Ask TIM",
-        "status": "live",
-        "version": "5.2",
-        "groq": bool(get_groq()),
-        "pinecone_index": os.getenv("PINECONE_INDEX", "tim-knowledge"),
-        "pinecone_connected": bool(get_pinecone()),
-        "endpoints": {
-            "ask": "/ask?q=your+question",
-            "health": "/health"
-        }
-    })
+    
+    q = request.args.get('q')
+    if q:
+        return ask()
+    
+    # Browser gets HTML, API gets JSON
+    if 'text/html' in request.headers.get('Accept', ''):
+        return f"""<html><body style="font-family:system-ui;padding:40px">
+        <h2>✓ Ask TIM v5.3 live</h2>
+        <p>Pinecone: tim-knowledge | Groq: {'OK' if get_groq() else 'missing'}</p>
+        <form><input name="q" placeholder="Ask..." style="width:300px"><button>Ask</button></form>
+        </body></html>"""
+    
+    return jsonify({"status":"live","version":"5.3","pinecone_index":"tim-knowledge"})
 
 @app.route('/health', methods=['GET'])
 def health():
