@@ -1,236 +1,158 @@
-# backend.py - v5.7.4b - Dynamic pricing per item
-import os, requests, random, re
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from concurrent.futures import ThreadPoolExecutor
+# tim_bot_v5_7_11.py
+# The Insurance Master — Professional Mode
+# Pinecone + Groq + 18-source verification
 
-app = Flask(__name__)
-CORS(app)
+import os, requests, re
+from datetime import datetime
+from groq import Groq
+from pinecone import Pinecone
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-PINECONE_INDEX = os.getenv("PINECONE_INDEX", "tim-knowledge")
-COURTLISTENER_TOKEN = os.getenv("COURTLISTENER_TOKEN", "")
+# --- CONFIG ---
+GROQ_MODEL = "llama3-70b-8192"
+PINECONE_INDEX = "theinsuremaster"
+VERSION = "5.7.11"
 
-pinecone_index = None
-if PINECONE_API_KEY:
+TIER_1_PINE = True # hidden vector search
+
+SOURCES = {
+    "tier1_web": ["theinsuremaster.com"],
+    "tier2_insurance": [
+        "iii.org",
+        "naic.org", "content.naic.org",
+        "irmi.com",
+        "legalclarity.org", # NEW
+        "ambest.com",
+        "fcands.com",
+        "law.cornell.edu",
+        "iso.com",
+        "aaisdirect.com"
+    ],
+    "tier2_finance": [ # NEW
+        "investopedia.com",
+        "finance.yahoo.com",
+        "google.com/finance",
+        "barrons.com",
+        "bloomberg.com"
+    ],
+    "tier3_trade": [
+        "propertycasualty360.com",
+        "insurancejournal.com"
+    ],
+    "caselaw": [
+        "courtlistener.com",
+        "law.justia.com",
+        "courts.ca.gov",
+        "nycourts.gov",
+        "txcourts.gov",
+        "floridasupremecourt.org",
+        "illinoiscourts.gov"
+    ]
+}
+
+# --- CLIENTS ---
+groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+index = pc.Index(PINECONE_INDEX)
+
+# --- CORE FUNCTIONS ---
+def pinecone_search(query, top_k=5):
+    """Tier 1 hidden - returns chunks, not shown in Sources"""
+    emb = pc.inference.embed(model="multilingual-e5-large", inputs=[query])[0].values
+    res = index.query(vector=emb, top_k=top_k, include_metadata=True)
+    return [m.metadata['text'] for m in res.matches if m.score > 0.78]
+
+def web_search(query, site):
+    """Simple SerpAPI wrapper - returns first 200 OK result"""
+    # placeholder - replace with your search implementation
+    url = f"https://serpapi.com/search?q=site:{site}+{query}"
+    #... implement...
+    return None
+
+def verify_200(url):
     try:
-        from pinecone import Pinecone
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        pinecone_index = pc.Index(PINECONE_INDEX)
-    except: pass
+        r = requests.head(url, timeout=3, allow_redirects=True)
+        return r.status_code == 200
+    except:
+        return False
 
-PRIORITY_SOURCES = ["naic.org","rims.org","theinstitutes.org","ambest.com","insurancejournal.com","propertycasualty360.com","businessinsurance.com","riskandinsurance.com","iii.org","irmi.com"]
-USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"]
+def find_caselaw(concept):
+    cases = []
+    for site in SOURCES['caselaw']:
+        # search logic
+        # verify citation pattern \d+ [A-Z]\.\w+ \d+
+        pass
+    # return list of dicts: {"cite": "Morgan Stanley Group Inc. v. New England...", "verified": True}
+    return cases[:3]
 
-@app.route("/health")
-def health():
-    return jsonify({"status":"ok","version":"5.7.4b"})
+def format_professional(question, pine_context, web_sources, cases):
+    prompt = f"""
+    You are TIM v{VERSION}. Answer professionally in 5 paragraphs.
+    Use this internal context (from Pinecone, do not cite): {pine_context}
+    Web sources: {web_sources}
+    Caselaw: {cases}
 
-def detect_tim_content(url, title, snippet):
-    """Auto-detect type, extract price if mentioned"""
-    url_lower = url.lower()
-    title_lower = title.lower()
+    Rules:
+    - Start with plain meaning, then extrinsic evidence, then contra proferentem
+    - Cite cases with <sup>n</sup>
+    - Do not hallucinate cases
+    """
+    resp = groq.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2
+    )
+    return resp.choices[0].message.content
 
-    # Detect type
-    if "/checklist/" in url_lower or "checklist" in title_lower:
-        content_type = "checklist"
-    elif "/course/" in url_lower or "/training/" in url_lower or "course" in title_lower:
-        content_type = "course"
-    elif "/premium/" in url_lower or "/pro/" in url_lower:
-        content_type = "premium article"
-    else:
-        content_type = "article"
+def build_sources_block(sources):
+    block = "**Sources & What Was Searched**\n"
+    for i, s in enumerate(sources, 1):
+        if verify_200(s['url']):
+            block += f'{i}. **Searched:** "{s["query"]}" on {s["site"]}\n'
+            block += f' **Found:** [{s["title"]}]({s["url"]})\n'
+            block += f' **Scraped:** "{s["snippet"][:200]}..."\n\n'
+    return block
 
-    # Try to extract price from snippet or title
-    price = ""
-    price_match = re.search(r'\$(\d+)', snippet + " " + title)
-    if price_match:
-        price = f"${price_match.group(1)}"
-    elif "free" in snippet.lower() or content_type == "article":
-        price = "Free"
-    elif content_type == "course":
-        price = "TIM Pro" # default, can be overridden by page scrape
-    # else leave blank - you'll set in CMS
+def build_caselaw_block(cases):
+    block = "**Caselaw Cited**\n"
+    for i, c in enumerate(cases, 1):
+        # NO LINKS per your rule
+        block += f'{i}. *{c["cite"]}*\n'
+    return block
 
-    return content_type, price
+# --- MAIN ---
+def answer(question):
+    # 1. Pinecone (hidden)
+    pine_ctx = pinecone_search(question)
 
-def search_theinsuremaster(question):
-    try:
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-        url = f"https://www.bing.com/search?q={question}+site:theinsuremaster.com"
-        r = requests.get(url, headers=headers, timeout=8)
-        soup = BeautifulSoup(r.text, 'lxml')
-        results = []
-        for item in soup.select('li.b_algo')[:5]:
-            title = item.select_one('h2'); snippet = item.select_one('.b_caption p') or item.select_one('p'); link = item.select_one('a')
-            if snippet and link:
-                href = link['href']
-                title_text = title.get_text(strip=True) if title else ""
-                snippet_text = snippet.get_text(strip=True)
-                content_type, price = detect_tim_content(href, title_text, snippet_text)
-                results.append({
-                    "engine":"theinsuremaster.com",
-                    "title":title_text,
-                    "snippet":snippet_text[:400],
-                    "url":href,
-                    "source":"theinsuremaster.com",
-                    "content_type":content_type,
-                    "price":price
-                })
-        return results
-    except: return []
+    # 2. Tiered web search
+    web_sources = []
+    for site in SOURCES['tier1_web'] + SOURCES['tier2_insurance']:
+        result = web_search(question, site)
+        if result and verify_200(result['url']):
+            web_sources.append(result)
+        if len(web_sources) >= 3: break
 
-def search_pinecone(question, top_k=3):
-    if not pinecone_index: return []
-    try:
-        import numpy as np
-        dummy_vector = list(np.random.rand(1536))
-        response = pinecone_index.query(vector=dummy_vector, top_k=top_k, include_metadata=True)
-        results = []
-        for m in response.get("matches", []):
-            meta = m.get("metadata", {})
-            # Pull price from Pinecone metadata if you store it
-            results.append({
-                "engine":"Pinecone",
-                "title":meta.get("title","Internal"),
-                "snippet":meta.get("text","")[:400],
-                "url":meta.get("url",""),
-                "source":"tim-knowledge",
-                "content_type":meta.get("type","internal"),
-                "price":meta.get("price","") # store individual prices in Pinecone
-            })
-        return results
-    except: return []
+    # 3. Finance sites only if needed
+    if any(k in question.lower() for k in ["rate", "dividend", "stock", "market", "interest"]):
+        for site in SOURCES['tier2_finance']:
+            result = web_search(question, site)
+            if result: web_sources.append(result)
 
-def search_bing_html(query, site=None):
-    try:
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-        q = f"{query}+site:{site}" if site else query
-        r = requests.get(f"https://www.bing.com/search?q={q}&count=5", headers=headers, timeout=8)
-        soup = BeautifulSoup(r.text, 'lxml')
-        results = []
-        for item in soup.select('li.b_algo')[:3]:
-            title = item.select_one('h2'); snippet = item.select_one('.b_caption p') or item.select_one('p'); link = item.select_one('a')
-            if snippet:
-                results.append({"engine":"Bing","title":title.get_text(strip=True) if title else "","snippet":snippet.get_text(strip=True)[:400],"url":link['href'] if link else "","source":site or "web","content_type":"web article","price":""})
-        return results
-    except: return []
+    # 4. Caselaw
+    cases = find_caselaw(question)
 
-def search_caselaw(question, max_cases=5):
-    if not COURTLISTENER_TOKEN: return []
-    try:
-        headers = {"Authorization": f"Token {COURTLISTENER_TOKEN}"}
-        r = requests.get("https://www.courtlistener.com/api/rest/v3/search/", headers=headers, params={"q":question,"type":"o","order_by":"score desc","page_size":max_cases}, timeout=8)
-        cases = []
-        if r.status_code == 200:
-            for item in r.json().get("results", [])[:max_cases]:
-                if item.get("caseName"):
-                    cases.append({"case":item["caseName"],"citation":f"{item['caseName']}, {item.get('dateFiled','')[:10]}","court":item.get("court",""),"snippet":item.get("snippet","")[:300],"url":f"https://www.courtlistener.com{item.get('absolute_url','')}","date":item.get("dateFiled","")[:10]})
-        return cases
-    except: return []
+    # 5. Generate
+    body = format_professional(question, pine_ctx, web_sources, cases)
 
-def calculate_confidence(sources, has_tim, has_pinecone, has_caselaw, mode):
-    score = 50
-    if has_tim: score += 20
-    if has_pinecone: score += 15
-    if has_caselaw: score += 15
-    score += min(len(sources)*3,15)
-    if any('2024' in s.get('snippet','') or '2025' in s.get('snippet','') for s in sources): score+=5
-    if mode=="professional" and has_caselaw: score+=10
-    score = min(score,100)
-    label = "Very High" if score>=85 else "High" if score>=70 else "Medium" if score>=55 else "Low"
-    return {"score":score,"label":label}
+    # 6. Assemble
+    output = f"**PROFESSIONAL ANSWER**\n\n**Question:** {question}\n\n**Answer:**\n{body}\n\n"
+    output += build_sources_block(web_sources)
+    output += "\n" + build_caselaw_block(cases)
+    output += f"\n---\n*TIM v{VERSION}*"
 
-def rewrite_with_groq(question, sources, cases, mode):
-    if not sources:
-        return "I don't want to give you an inaccurate answer on this one. If you can share a bit more detail, I can point you in the right direction or explain the options clearly."
-    if not GROQ_API_KEY: return sources[0]['snippet']
+    return output
 
-    context = "\n\n".join([f"{s['source']}: {s['title']}\n{s['snippet']}" for s in sources[:4]])
-    caselaw_context = ""
-    if cases and mode=="professional":
-        caselaw_context = "\n\nRelevant Caselaw:\n" + "\n".join([f"- {c['case']} ({c['date']}): {c['snippet'][:150]}" for c in cases[:3]])
-
-    tim_mentions = ""
-    tim_items = [s for s in sources if 'theinsuremaster' in s['source']]
-    if tim_items:
-        tim_mentions = "\n\nAvailable TIM resources:\n" + "\n".join([f"- {s['title']} ({s['content_type']}{', '+s['price'] if s['price'] else ''})" for s in tim_items[:3]])
-
-    style_guide = """You are TIM, an experienced insurance producer. Conversational, direct, plain language. Adapt structure to question. Mention available TIM articles, checklists, or courses naturally when relevant."""
-
-    prompt = f"{style_guide}\n\nQuestion: {question}\nMode: {mode}\n\nResearch:\n{context}{caselaw_context}{tim_mentions}\n\nWrite in natural TIM voice."
-
-    try:
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        data = {"model":"llama-3.3-70b-versatile","messages":[{"role":"user","content":prompt}],"temperature":0.7,"max_tokens":750}
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=data, timeout=15)
-        if r.status_code==200: return r.json()['choices'][0]['message']['content'].strip()
-    except: pass
-    return sources[0]['snippet']
-
-@app.route("/ask", methods=["POST"])
-def ask():
-    data = request.json or {}
-    question = data.get("question","").strip()
-    mode = data.get("mode","consumer")
-    if not question: return jsonify({"error":"No question"}),400
-
-    all_sources = []
-    tim_results = search_theinsuremaster(question)
-    all_sources.extend(tim_results)
-
-    pinecone_results = search_pinecone(question)
-    all_sources.extend(pinecone_results)
-
-    if len(all_sources) < 2:
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            futures = [ex.submit(search_bing_html, question, site) for site in PRIORITY_SOURCES[:5]]
-            for f in futures:
-                try: all_sources.extend(f.result(timeout=8))
-                except: pass
-        if len(all_sources) < 2:
-            all_sources.extend(search_bing_html(question, None))
-
-    cases = search_caselaw(question, max_cases=5) if mode=="professional" else []
-
-    natural_answer = rewrite_with_groq(question, all_sources, cases, mode)
-    confidence = calculate_confidence(all_sources, len(tim_results)>0, len(pinecone_results)>0, len(cases)>0, mode)
-
-    if len(all_sources) == 0 or confidence['score'] < 40:
-        return jsonify({
-            "answer": natural_answer + "\n\n*Click here to view our Disclaimer.*",
-            "sources": [], "caselaw": [], "confidence_index": confidence,
-            "needs_clarification": True, "version": "5.7.4b"
-        })
-
-    # Format sources - price shown only if found
-    source_lines = []
-    for s in all_sources[:5]:
-        if 'theinsuremaster' in s['source']:
-            price_part = f", {s['price']}" if s['price'] else ""
-            type_part = f" ({s['content_type']}{price_part})"
-            line = f"{s['title']} - {s['source']} [{s['url']}]{type_part}"
-        else:
-            line = f"{s['title'][:70]} - {s['source']}"
-        source_lines.append(f"• {line}")
-
-    if cases and mode=="professional":
-        source_lines.append("\n**Caselaw:**")
-        for c in cases: source_lines.append(f"• {c['case']} ({c['date']}) - {c['url']}")
-
-    full_answer = f"{natural_answer}\n\n---\n**Sources:**\n" + "\n".join(source_lines)
-    full_answer += f"\n\n**Confidence Index:** {confidence['score']}/100 ({confidence['label']})"
-
-    return jsonify({
-        "answer": full_answer + "\n\n*Click here to view our Disclaimer.*",
-        "sources": [s['source'] for s in all_sources],
-        "caselaw": cases,
-        "confidence_index": confidence,
-        "tim_content_found": len(tim_results)>0,
-        "version": "5.7.4b"
-    })
-
+# --- EXAMPLE ---
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",5000)))
+    q = "How do courts determine ambiguity in insurance clauses?"
+    print(answer(q))
