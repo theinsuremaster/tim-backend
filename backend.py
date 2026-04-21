@@ -1,11 +1,12 @@
 """
-Ask TIM v5.2 - Crash-proof for Render
-- Uses correct Pinecone index: tim-knowledge
-- Lazy init to avoid startup crash
+Ask TIM v5.3.1 - HTML test page + Consumer/Professional modes
+- Root / returns HTML test page (fixes your test page)
+- /health returns JSON for Render
+- /ask supports ?mode=consumer or ?mode=professional
+- Uses tim-knowledge Pinecone index
 """
 
 import os
-import json
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -16,7 +17,6 @@ import traceback
 app = Flask(__name__)
 CORS(app)
 
-# --- Lazy clients ---
 _groq_client = None
 _pinecone_index = None
 _embedder = None
@@ -27,15 +27,10 @@ def get_groq():
         try:
             from groq import Groq
             key = os.getenv("GROQ_API_KEY")
-            if not key:
-                print("WARNING: GROQ_API_KEY not set")
-                return None
-            _groq_client = Groq(api_key=key)
-            print("Groq initialized")
+            if key:
+                _groq_client = Groq(api_key=key)
         except Exception as e:
-            print("Groq init error:", e)
-            traceback.print_exc()
-            return None
+            print("Groq error:", e)
     return _groq_client
 
 def get_pinecone():
@@ -44,18 +39,12 @@ def get_pinecone():
         try:
             from pinecone import Pinecone
             key = os.getenv("PINECONE_API_KEY")
-            if not key:
-                print("INFO: PINECONE_API_KEY not set - skipping")
-                return None
-            pc = Pinecone(api_key=key)
-            # CORRECT INDEX NAME
-            idx_name = os.getenv("PINECONE_INDEX", "tim-knowledge")
-            _pinecone_index = pc.Index(idx_name)
-            print(f"Pinecone initialized: {idx_name}")
+            if key:
+                pc = Pinecone(api_key=key)
+                idx = os.getenv("PINECONE_INDEX", "tim-knowledge")
+                _pinecone_index = pc.Index(idx)
         except Exception as e:
-            print("Pinecone init error:", e)
-            traceback.print_exc()
-            return None
+            print("Pinecone error:", e)
     return _pinecone_index
 
 def get_embedder():
@@ -64,69 +53,67 @@ def get_embedder():
         try:
             from fastembed import TextEmbedding
             _embedder = TextEmbedding('BAAI/bge-small-en-v1.5')
-        except Exception as e:
-            print("Embedder error:", e)
-            return None
+        except: pass
     return _embedder
 
 def get_user_region():
-    country = request.headers.get('CF-IPCountry', 'US').upper()
-    if country in ['US','CA','MX','BR','AR']: return 'Americas'
-    if country in ['GB','DE','FR','IT','ES','NL','SE','CH']: return 'Europe'
-    if country in ['IN','JP','CN','SG','AU','HK','KR']: return 'Asia-Pacific'
+    country = request.headers.get('CF-IPCountry', 'US')
+    if not country or country == 'XX':
+        try:
+            ip = request.headers.get('X-Forwarded-For', '').split(',')[0]
+            if ip:
+                r = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=1).json()
+                country = r.get('countryCode', 'US')
+        except: country = 'US'
+    c = country.upper()
+    if c in ['US','CA','MX','BR','AR']: return 'Americas'
+    if c in ['GB','DE','FR','IT','ES','NL','SE']: return 'Europe'
+    if c in ['IN','JP','CN','SG','AU']: return 'Asia-Pacific'
     return 'Americas'
 
 def search_insuremaster(query):
     try:
         url = f"https://theinsuremaster.com/?s={requests.utils.quote(query)}"
-        r = requests.get(url, timeout=5, headers={"User-Agent":"AskTIM/5.2"})
+        r = requests.get(url, timeout=5, headers={"User-Agent":"AskTIM"})
         soup = BeautifulSoup(r.text, 'lxml')
-        results = []
-        for item in soup.select('article')[:3]:
-            a = item.select_one('h2 a, h3 a')
-            if not a: continue
+        out = []
+        for a in soup.select('article h2 a, article h3 a')[:3]:
             title = a.get_text(strip=True)
             link = a['href']
-            price = ""
+            price = ''
             if '/product/' in link:
                 try:
                     p = requests.get(link, timeout=3)
-                    ps = BeautifulSoup(p.text, 'lxml')
-                    pr = ps.select_one('.price .amount, .woocommerce-Price-amount')
+                    pr = BeautifulSoup(p.text,'lxml').select_one('.amount')
                     if pr: price = f" - {pr.get_text(strip=True)}"
                 except: pass
-            results.append({"title": title, "url": link, "price": price})
-        return results
-    except Exception as e:
-        print("Site search error:", e)
-        return []
+            out.append({"title": title, "url": link, "price": price})
+        return out
+    except: return []
 
 def search_pinecone(query, region):
     idx = get_pinecone()
     emb = get_embedder()
     if not idx or not emb: return []
     try:
-        q_emb = list(emb.embed([query]))[0].tolist()
-        res = idx.query(vector=q_emb, top_k=3, include_metadata=True,
-                       filter={"region": {"$in": [region.lower(), "global"]}})
-        out = []
-        for m in res.get('matches', []):
-            md = m.get('metadata', {})
-            out.append({"title": md.get('title','Knowledge Base'), "url": md.get('url',''), "source": "tim-knowledge"})
-        return out
-    except Exception as e:
-        print("Pinecone query error:", e)
-        return []
+        vec = list(emb.embed([query]))[0].tolist()
+        res = idx.query(vector=vec, top_k=3, include_metadata=True,
+                       filter={"region":{"$in":[region.lower(),"global"]}})
+        return [{"title": m['metadata'].get('title',''), "url": m['metadata'].get('url','')} 
+                for m in res.get('matches',[])]
+    except: return []
 
-TIM_PROMPT = """You are Ask TIM for theinsuremaster.com. USER REGION: {region}
+# Prompts with audience differentiation
+PROMPT_PRO = """You are Ask TIM for insurance professionals at theinsuremaster.com. USER REGION: {region}
 
-Respond in EXACT format:
+Use technical insurance language. Cite policy forms, endorsements, case law.
 
+Format:
 1. DIRECT ANSWER:
-[1-2 sentences]
+[1-2 sentences, technical]
 
 2. EXPLANATION:
-[3-4 sentences with {region} law/cases only]
+[3-4 sentences with {region} statutes/cases]
 
 3. REFERENCES:
 {refs}
@@ -134,76 +121,129 @@ Respond in EXACT format:
 4. CONFIDENCE: High/Medium/Low
 """
 
-@app.route('/', methods=['GET', 'HEAD'])
+PROMPT_CONSUMER = """You are Ask TIM for insurance consumers at theinsuremaster.com. USER REGION: {region}
+
+Explain in plain English, no jargon. No case citations. Focus on what it means for their policy and what to do next.
+
+Format:
+1. DIRECT ANSWER:
+[1-2 simple sentences]
+
+2. EXPLANATION:
+[3-4 sentences in plain language for {region}]
+
+3. REFERENCES:
+{refs}
+
+4. CONFIDENCE: High/Medium/Low
+"""
+
+@app.route('/', methods=['GET','HEAD'])
 def home():
     if request.method == 'HEAD':
         return '', 200
     
     q = request.args.get('q')
+    mode = request.args.get('mode', 'professional')
+    
+    # If query present, process it
     if q:
         return ask()
     
-    # Browser gets HTML, API gets JSON
-    if 'text/html' in request.headers.get('Accept', ''):
-        return f"""<html><body style="font-family:system-ui;padding:40px">
-        <h2>✓ Ask TIM v5.3 live</h2>
-        <p>Pinecone: tim-knowledge | Groq: {'OK' if get_groq() else 'missing'}</p>
-        <form><input name="q" placeholder="Ask..." style="width:300px"><button>Ask</button></form>
-        </body></html>"""
+    # HTML test page (this is what you had before)
+    groq_ok = '✓' if get_groq() else '✗'
+    pc_ok = '✓' if get_pinecone() else '✗'
     
-    return jsonify({"status":"live","version":"5.3","pinecone_index":"tim-knowledge"})
+    return f"""
+    <!DOCTYPE html>
+    <html><head><title>Ask TIM Test</title>
+    <style>body{{font-family:system-ui;padding:40px;max-width:800px;margin:auto}}
+    input,select{{padding:10px;font-size:16px}} button{{padding:10px 20px}}
+    .status{{background:#f0f0f0;padding:15px;border-radius:8px;margin-bottom:20px}}
+    </style></head><body>
+    <h1>Ask TIM v5.3.1</h1>
+    <div class="status">
+      <b>Status:</b> Live<br>
+      <b>Groq:</b> {groq_ok} &nbsp; <b>Pinecone (tim-knowledge):</b> {pc_ok}
+    </div>
+    
+    <form action="/" method="get">
+      <input type="text" name="q" placeholder="Ask about coverage..." style="width:400px" required>
+      <select name="mode">
+        <option value="professional" {"selected" if mode=="professional" else ""}>Professional</option>
+        <option value="consumer" {"selected" if mode=="consumer" else ""}>Consumer</option>
+      </select>
+      <button type="submit">Ask TIM</button>
+    </form>
+    
+    <p style="margin-top:30px;color:#666">API: <a href="/health">/health</a> | 
+    Example: <a href="/?q=what is an additional insured&mode=consumer">Consumer test</a> | 
+    <a href="/?q=additional insured exclusion&mode=professional">Pro test</a></p>
+    </body></html>
+    """
 
-@app.route('/health', methods=['GET'])
+@app.route('/health')
 def health():
-    # keep /health for backwards compatibility
-    return home()
+    return jsonify({
+        "status": "ok",
+        "version": "5.3.1",
+        "groq": bool(get_groq()),
+        "pinecone_index": os.getenv("PINECONE_INDEX", "tim-knowledge"),
+        "pinecone_connected": bool(get_pinecone())
+    })
+
+@app.route('/ask', methods=['GET','POST'])
+def ask():
+    data = request.json or {}
+    q = request.args.get('q') or data.get('q','')
+    mode = request.args.get('mode') or data.get('mode','professional')
+    if not q:
+        return jsonify({"error":"No query"}), 400
     
     region = get_user_region()
+    audience = 'consumer' if mode.lower() == 'consumer' else 'professional'
     
-    # 1. Website first
-    site_results = search_insuremaster(q)
-    # 2. Pinecone second (tim-knowledge)
-    pc_results = search_pinecone(q, region)
+    site = search_insuremaster(q)
+    pc = search_pinecone(q, region)
     
-    # Build refs - single line markdown
     refs = []
-    for r in site_results[:2]:
-        title = r['title'] + r.get('price','')
-        refs.append(f"- [{title}]({r['url']})")
-    for r in pc_results[:1]:
-        if r['url']:
-            refs.append(f"- [{r['title']}]({r['url']})")
-    if not refs:
-        refs.append("- [The InsureMaster](https://theinsuremaster.com)")
+    for r in site[:2]:
+        refs.append(f"- [{r['title']}{r.get('price','')}]({r['url']})")
+    for r in pc[:1]:
+        if r.get('url'): refs.append(f"- [{r['title']}]({r['url']})")
+    if not refs: refs.append("- [The InsureMaster](https://theinsuremaster.com)")
     refs_md = "\n".join(refs)
     
+    prompt = PROMPT_CONSUMER if audience == 'consumer' else PROMPT_PRO
     client = get_groq()
+    
     if not client:
-        answer = f"1. DIRECT ANSWER:\nConfiguration needed.\n\n2. EXPLANATION:\nGROQ_API_KEY missing in Render.\n\n3. REFERENCES:\n{refs_md}\n\n4. CONFIDENCE: Low"
+        answer = f"1. DIRECT ANSWER:\nSetup needed.\n\n2. EXPLANATION:\nAdd GROQ_API_KEY.\n\n3. REFERENCES:\n{refs_md}\n\n4. CONFIDENCE: Low"
     else:
         try:
             resp = client.chat.completions.create(
                 model="llama3-70b-8192",
                 messages=[
-                    {"role":"system","content": TIM_PROMPT.format(region=region, refs=refs_md)},
-                    {"role":"user","content": q}
+                    {"role":"system","content": prompt.format(region=region, refs=refs_md)},
+                    {"role":"user","content": f"[{audience.upper()}] {q}"}
                 ],
-                temperature=0.1,
-                max_tokens=600
+                temperature=0.2 if audience=='consumer' else 0.1,
+                max_tokens=700
             )
             answer = resp.choices[0].message.content
         except Exception as e:
-            print("Groq error:", e)
-            answer = f"1. DIRECT ANSWER:\nError.\n\n2. EXPLANATION:\n{str(e)}\n\n3. REFERENCES:\n{refs_md}\n\n4. CONFIDENCE: Low"
+            answer = f"Error: {str(e)}"
     
-    # Log query
-    try:
-        with open("/tmp/queries.log","a") as f:
-            f.write(f"{datetime.utcnow().isoformat()},{region},{q}\n")
-    except: pass
+    # Return HTML if browser, JSON if API
+    if 'text/html' in request.headers.get('Accept','') and not request.path.startswith('/ask'):
+        return f"<pre style='font-family:system-ui;white-space:pre-wrap;padding:40px'>{answer}</pre><p><a href='/'>← Back</a></p>"
     
-    return jsonify({"query": q, "region": region, "answer": answer, "sources": {"website": len(site_results), "pinecone": len(pc_results)}})
+    return jsonify({
+        "query": q,
+        "mode": audience,
+        "region": region,
+        "answer": answer
+    })
 
 if __name__ == '__main__':
-    port = int(os.getenv("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT",5000)))
