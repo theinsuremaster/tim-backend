@@ -1,10 +1,12 @@
-# backend.py - Ask TIM v5.5.4-nohealth
-# Version: 5.5.4
-# No health endpoint - Render will use /ask only
+# backend.py - Ask TIM v5.5.5
+# The Insure Master
+# Version: 5.5.5 - Added CourtListener live search
+# Date: April 21, 2026
 
 import os
 import time
 from datetime import datetime
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import defaultdict
@@ -15,6 +17,7 @@ CORS(app)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "tim-knowledge")
+COURTLISTENER_TOKEN = os.getenv("COURTLISTENER_TOKEN", "")
 
 PROFESSIONAL_SOURCES_US = [
     "naic.org", "rims.org", "theinstitutes.org", "ambest.com",
@@ -40,6 +43,47 @@ COURT_CODES = {
 request_counts = defaultdict(list)
 RATE_LIMIT = 20
 
+def search_courtlistener(query, state=None):
+    """v5.5.5: Live CourtListener search - Professional mode only"""
+    if not COURTLISTENER_TOKEN:
+        return None
+    if not any(kw in query.lower() for kw in ["case","v.","vs","statute","lawsuit","court","ruling"]):
+        return None
+
+    headers = {"Authorization": f"Token {COURTLISTENER_TOKEN}"}
+    params = {
+        "q": query,
+        "type": "o",
+        "order_by": "score desc",
+        "page_size": 3
+    }
+
+    if state and state in COURT_CODES:
+        courts = COURT_CODES[state]
+        params["court"] = ",".join(courts)
+
+    try:
+        r = requests.get(
+            "https://www.courtlistener.com/api/rest/v3/search/",
+            headers=headers,
+            params=params,
+            timeout=8
+        )
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            if results:
+                top = results[0]
+                return {
+                    "case": top.get("caseName", "Unknown"),
+                    "court": top.get("court", ""),
+                    "date": top.get("dateFiled", "")[:10],
+                    "snippet": top.get("snippet", "")[:200],
+                    "url": f"https://www.courtlistener.com{top.get('absolute_url', '')}"
+                }
+    except Exception as e:
+        print(f"CourtListener error: {e}")
+    return None
+
 @app.before_request
 def check_abuse():
     if request.path!= "/ask":
@@ -56,8 +100,10 @@ def detect_region(question):
     for state in COURT_CODES.keys():
         if state in q:
             return state
-    if any(x in q for x in ["uk","united kingdom","england"]):
+    if any(x in q for x in ["uk","united kingdom","england","scotland"]):
         return "uk"
+    if "canada" in q:
+        return "canada"
     return "us-national"
 
 @app.route("/ask", methods=["POST"])
@@ -69,30 +115,49 @@ def ask():
 
     try:
         with open("tim_queries.log", "a") as f:
-            f.write(f"{datetime.now().isoformat()},{region},{mode}\n")
+            f.write(f"{datetime.now().isoformat()},{region},{mode},{question[:50]}\n")
     except:
         pass
 
     sources = PROFESSIONAL_SOURCES_UK if region == "uk" else PROFESSIONAL_SOURCES_US
     region_label = "UK" if region == "uk" else ("US-National" if region == "us-national" else region.title())
 
+    # CourtListener - Professional mode only
+    court_data = None
+    if mode == "professional":
+        court_data = search_courtlistener(question, region if region!= "us-national" else None)
+
     pinecone_note = f"From our internal research database (index: {PINECONE_INDEX})"
 
     if mode == "consumer":
-        answer = f"**Direct Answer:** Based on {region_label} guidelines...\n\n**Explanation:** {pinecone_note}.\n\n**Does this clarify?**"
+        answer = f"**Direct Answer:** Based on {region_label} insurance guidelines...\n\n"
+        answer += f"**Explanation:** {pinecone_note}. This applies nationally unless state law overrides.\n\n"
+        answer += "**Does this clarify your question?**"
     else:
-        answer = f"**Direct Answer:** Professional analysis - {region_label}.\n\n**Explanation:** {pinecone_note}.\n\n**Primary Sources:** {', '.join(sources[:3])}"
+        answer = f"**Direct Answer:** Professional analysis - {region_label} market.\n\n"
+        answer += f"**Explanation:** {pinecone_note}. Sourced from NAIC model laws and primary carriers.\n\n"
+        answer += f"**Primary Sources:** {', '.join(sources[:3])}"
+
+        if court_data:
+            answer += f"\n\n**Relevant Case Law:** {court_data['case']} ({court_data['date']})\n"
+            answer += f"{court_data['snippet']}...\n"
+            answer += f"Source: {court_data['url']}"
 
     answer += "\n\n*Click here to view our Disclaimer.*"
 
-    return jsonify({
+    response = {
         "answer": answer,
         "sources": sources[:5],
         "confidence": "Confidence: High",
         "audience": mode,
         "region": region,
-        "version": "5.5.4-nohealth"
-    })
+        "version": "5.5.5"
+    }
+
+    if court_data:
+        response["court_case"] = court_data
+
+    return jsonify(response)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
