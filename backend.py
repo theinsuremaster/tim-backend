@@ -190,7 +190,7 @@ def ask():
     else:
         try:
             resp = client.chat.completions.create(
-                model="llama3-70b-8192",
+                model="llama-3.3-70b-versatile",
                 messages=[
                     {"role":"system","content": prompt.format(region=region, refs=refs_md)},
                     {"role":"user","content": q}
